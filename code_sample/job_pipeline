@@ -1,0 +1,1404 @@
+import requests
+import time
+import logging
+from typing import List, Dict
+import pandas as pd
+from datetime import datetime
+import sqlite3
+import json
+import csv
+import hashlib
+import os
+import re
+
+# Configure logging to handle Unicode properly
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler('job_pipeline.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class AdzunaCollector:
+    def __init__(self):
+        self.base_url = "https://api.adzuna.com/v1/api/jobs"
+        self.app_id = "41102b43"
+        self.app_key = "900ce47cfd25f41ae596b9ab0de7527d"
+    
+    def fetch_jobs(self, keywords: str, country: str = 'us', 
+                   max_results: int = 1000, delay: float = 1.0) -> List[Dict]:
+        """
+        Fetch jobs from Adzuna API with pagination
+        Returns list of standardized job dictionaries
+        """
+        all_jobs = []
+        results_per_page = 50
+        max_pages = (max_results // results_per_page) + 1
+        
+        for page in range(1, max_pages + 1):
+            try:
+                url = f"{self.base_url}/{country}/search/{page}"
+                params = {
+                    'app_id': self.app_id,
+                    'app_key': self.app_key,
+                    'what': keywords,
+                    'results_per_page': results_per_page,
+                    'where': 'United States',
+                    'max_days_old': 30,
+                    'sort_by': 'date'
+                }
+                
+                logger.info(f"Fetching Adzuna page {page}")
+                response = requests.get(url, params=params, timeout=30)
+                
+                # Check for 400 error
+                if response.status_code == 400:
+                    logger.warning(f"Adzuna API returned 400 for page {page}. Checking response...")
+                    try:
+                        error_data = response.json()
+                        logger.warning(f"Adzuna API error: {error_data}")
+                    except:
+                        logger.warning(f"Adzuna API error response: {response.text[:200]}")
+                    break
+                
+                response.raise_for_status()
+                
+                data = response.json()
+                jobs = data.get('results', [])
+                
+                if not jobs:
+                    logger.info("No more jobs found")
+                    break
+                
+                # Standardize job format
+                standardized_jobs = self._standardize_jobs(jobs)
+                all_jobs.extend(standardized_jobs)
+                
+                logger.info(f"Page {page}: Collected {len(jobs)} jobs. Total: {len(all_jobs)}")
+                
+                # Respect rate limits
+                time.sleep(delay)
+                
+                # Early exit if we have enough
+                if len(all_jobs) >= max_results:
+                    all_jobs = all_jobs[:max_results]
+                    break
+                    
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error fetching page {page}: {e}")
+                break
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+                break
+        
+        return all_jobs
+    
+    def _standardize_jobs(self, raw_jobs: List[Dict]) -> List[Dict]:
+        """Convert Adzuna API response to standardized format"""
+        standardized = []
+        
+        for job in raw_jobs:
+            try:
+                # Extract salary information
+                salary_min = job.get('salary_min')
+                salary_max = job.get('salary_max')
+                
+                # Convert to float if they exist
+                if salary_min is not None:
+                    salary_min = float(salary_min)
+                if salary_max is not None:
+                    salary_max = float(salary_max)
+                
+                salary = None
+                if salary_min and salary_max:
+                    salary = f"${salary_min:,.0f} - ${salary_max:,.0f}"
+                elif salary_min:
+                    salary = f"From ${salary_min:,.0f}"
+                elif salary_max:
+                    salary = f"Up to ${salary_max:,.0f}"
+                
+                # Parse post date
+                post_date = job.get('created')
+                if post_date:
+                    try:
+                        # Convert from ISO format if needed
+                        if 'T' in post_date:
+                            post_date = post_date.split('T')[0]
+                    except:
+                        pass
+                
+                # Standardized job object
+                std_job = {
+                    'source': 'adzuna',
+                    'source_id': job.get('id'),
+                    'title': job.get('title', '').strip(),
+                    'company': job.get('company', {}).get('display_name', 'Unknown'),
+                    'company_standardized': job.get('company', {}).get('display_name', 'Unknown'),
+                    'location': job.get('location', {}).get('display_name', 'Remote'),
+                    'location_standardized': job.get('location', {}).get('display_name', 'Remote'),
+                    'description': job.get('description', ''),
+                    'url': job.get('redirect_url'),
+                    'post_date': post_date,
+                    'post_date_str': post_date,
+                    'scraped_at': datetime.now().isoformat(),
+                    'scraped_at_str': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'salary': salary,
+                    'salary_min': salary_min,
+                    'salary_max': salary_max,
+                    'salary_min_parsed': salary_min,
+                    'salary_max_parsed': salary_max,
+                    'contract_type': job.get('contract_type', 'Full-time'),
+                    'job_type': job.get('contract_type', 'Full-time'),
+                    'category': job.get('category', {}).get('label', ''),
+                    'required_skills': self._extract_skills(job.get('description', '')),
+                    'is_remote': 'remote' in str(job.get('location', {})).lower(),
+                    'work_arrangement': 'Remote' if 'remote' in str(job.get('location', {})).lower() else 'On-site'
+                }
+                
+                # Calculate salary midpoint
+                if salary_min and salary_max:
+                    std_job['salary_midpoint'] = (salary_min + salary_max) / 2
+                    std_job['salary_range'] = f"${salary_min:,.0f}-${salary_max:,.0f}"
+                
+                standardized.append(std_job)
+                
+            except Exception as e:
+                logger.warning(f"Failed to standardize job: {e}")
+                continue
+        
+        return standardized
+    
+    def _extract_skills(self, description: str) -> List[str]:
+        """Extract technical skills from job description"""
+        if not description:
+            return []
+        
+        skills_keywords = {
+            'python', 'sql', 'r', 'java', 'scala',
+            'tensorflow', 'pytorch', 'scikit-learn', 'keras',
+            'aws', 'azure', 'gcp', 'docker', 'kubernetes',
+            'spark', 'hadoop', 'kafka', 'airflow',
+            'tableau', 'powerbi', 'looker', 'snowflake',
+            'pandas', 'numpy', 'matplotlib', 'seaborn'
+        }
+        
+        found_skills = []
+        description_lower = description.lower()
+        
+        for skill in skills_keywords:
+            if skill in description_lower:
+                found_skills.append(skill)
+        
+        return found_skills
+
+
+class USAJobsCollector:
+    def __init__(self):
+        self.base_url = "https://data.usajobs.gov/api"
+        self.api_key = "7eagElGMEVWmfiORbEtfKjD61RljTIdJZzJVucUv4xY="
+        self.user_email = "ayushwww4@gmail.com"
+        self.headers = {
+            'User-Agent': self.user_email,
+            'Authorization-Key': self.api_key,
+            'Accept': 'application/json'
+        }
+    
+    def fetch_jobs(self, keywords: str, max_results: int = 500) -> List[Dict]:
+        """Fetch U.S. government jobs from USAJOBS API"""
+        all_jobs = []
+        page = 1
+        results_per_page = 100
+        
+        try:
+            while len(all_jobs) < max_results:
+                url = f"{self.base_url}/search"
+                params = {
+                    'Keyword': keywords,
+                    'ResultsPerPage': results_per_page,
+                    'Page': page,
+                    'DatePosted': 30,  # Last 30 days
+                    'SortField': 'PublicationStartDate',
+                    'SortDirection': 'Descending'
+                }
+                
+                logger.info(f"Fetching USAJOBS page {page}")
+                response = requests.get(url, headers=self.headers, 
+                                      params=params, timeout=30)
+                response.raise_for_status()
+                
+                data = response.json()
+                search_result = data.get('SearchResult', {})
+                jobs = search_result.get('SearchResultItems', [])
+                
+                if not jobs:
+                    break
+                
+                standardized_jobs = self._standardize_jobs(jobs)
+                all_jobs.extend(standardized_jobs)
+                
+                logger.info(f"Page {page}: Collected {len(jobs)} jobs. Total: {len(all_jobs)}")
+                
+                # Check if we should continue
+                matchend_count = search_result.get('SearchResultCountAll', 0)
+                if len(all_jobs) >= min(max_results, matchend_count):
+                    break
+                
+                page += 1
+                
+        except Exception as e:
+            logger.error(f"Error fetching USAJOBS data: {e}")
+        
+        return all_jobs[:max_results]
+    
+    def _standardize_jobs(self, raw_jobs: List[Dict]) -> List[Dict]:
+        """Standardize USAJOBS format to common format"""
+        standardized = []
+        
+        for item in raw_jobs:
+            try:
+                matched_object = item.get('MatchedObjectDescriptor', {})
+                
+                # Extract salary info - FIXED: Handle string to float conversion
+                salary_data = matched_object.get('PositionRemuneration', [{}])
+                salary_min = salary_data[0].get('MinimumRange') if salary_data else None
+                salary_max = salary_data[0].get('MaximumRange') if salary_data else None
+                
+                # Convert to float if they exist and are not None
+                if salary_min is not None:
+                    try:
+                        salary_min = float(salary_min)
+                    except (ValueError, TypeError):
+                        salary_min = None
+                
+                if salary_max is not None:
+                    try:
+                        salary_max = float(salary_max)
+                    except (ValueError, TypeError):
+                        salary_max = None
+                
+                # Format salary display
+                salary = None
+                if salary_min is not None and salary_max is not None:
+                    salary = f"${salary_min:,.0f} - ${salary_max:,.0f}"
+                elif salary_min is not None:
+                    salary = f"From ${salary_min:,.0f}"
+                elif salary_max is not None:
+                    salary = f"Up to ${salary_max:,.0f}"
+                else:
+                    salary = "Not specified"
+                
+                # Extract description
+                description = self._extract_description(matched_object)
+                
+                # Standardized job object
+                std_job = {
+                    'source': 'usajobs',
+                    'source_id': matched_object.get('PositionID'),
+                    'title': matched_object.get('PositionTitle', ''),
+                    'company': matched_object.get('OrganizationName', 'U.S. Government'),
+                    'company_standardized': matched_object.get('OrganizationName', 'U.S. Government'),
+                    'location': self._extract_location(matched_object),
+                    'location_standardized': self._extract_location(matched_object),
+                    'description': description,
+                    'url': matched_object.get('PositionURI'),
+                    'post_date': matched_object.get('PublicationStartDate'),
+                    'post_date_str': matched_object.get('PublicationStartDate'),
+                    'scraped_at': datetime.now().isoformat(),
+                    'scraped_at_str': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'salary': salary,
+                    'salary_min': salary_min,
+                    'salary_max': salary_max,
+                    'salary_min_parsed': salary_min,
+                    'salary_max_parsed': salary_max,
+                    'job_type': matched_object.get('PositionSchedule', [{}])[0].get('Name', 'Full-time'),
+                    'work_arrangement': 'Remote' if self._check_remote(matched_object) else 'On-site',
+                    'required_skills': self._extract_skills(description),
+                    'is_remote': self._check_remote(matched_object),
+                    'job_grade': matched_object.get('JobGrade', [{}])[0].get('Code') if matched_object.get('JobGrade') else None,
+                    'clearance_required': self._check_clearance(matched_object),
+                    'employment_type': matched_object.get('PositionSchedule', [{}])[0].get('Name', 'Full-time')
+                }
+                
+                # Calculate salary midpoint
+                if salary_min is not None and salary_max is not None:
+                    std_job['salary_midpoint'] = (salary_min + salary_max) / 2
+                    std_job['salary_range'] = f"${salary_min:,.0f}-${salary_max:,.0f}"
+                
+                standardized.append(std_job)
+                
+            except Exception as e:
+                logger.warning(f"Failed to standardize USAJOBS entry: {e}")
+                continue
+        
+        return standardized
+    
+    def _extract_location(self, job_data: Dict) -> str:
+        """Extract location from USAJOBS data"""
+        locations = job_data.get('PositionLocation', [])
+        if locations:
+            return locations[0].get('LocationName', 'Multiple Locations')
+        return 'Multiple Locations'
+    
+    def _extract_description(self, job_data: Dict) -> str:
+        """Combine description fields"""
+        desc_parts = []
+        
+        # Add qualification summary
+        qualification = job_data.get('QualificationSummary', '')
+        if qualification:
+            desc_parts.append(f"Qualifications: {qualification}")
+        
+        # Add duties
+        duties = job_data.get('UserArea', {}).get('Details', {}).get('Duties', '')
+        if duties:
+            desc_parts.append(f"Duties: {duties}")
+        
+        # Add major duties
+        major_duties = job_data.get('MajorDuties', [])
+        if major_duties:
+            desc_parts.append("Major Duties:")
+            desc_parts.extend([f"- {duty}" for duty in major_duties])
+        
+        return "\n\n".join(desc_parts)
+    
+    def _check_remote(self, job_data: Dict) -> bool:
+        """Check if job is remote"""
+        locations = job_data.get('PositionLocation', [])
+        for location in locations:
+            if 'remote' in location.get('LocationName', '').lower():
+                return True
+        return False
+    
+    def _check_clearance(self, job_data: Dict) -> bool:
+        """Check if security clearance is required"""
+        user_area = job_data.get('UserArea', {})
+        details = user_area.get('Details', {})
+        return details.get('SecurityClearanceRequired', False)
+    
+    def _extract_skills(self, description: str) -> List[str]:
+        """Extract technical skills from job description"""
+        if not description:
+            return []
+        
+        skills_keywords = {
+            'python', 'sql', 'r', 'java', 'scala',
+            'tensorflow', 'pytorch', 'scikit-learn', 'keras',
+            'aws', 'azure', 'gcp', 'docker', 'kubernetes',
+            'spark', 'hadoop', 'kafka', 'airflow',
+            'tableau', 'powerbi', 'looker', 'snowflake',
+            'pandas', 'numpy', 'matplotlib', 'seaborn',
+            'security', 'clearance', 'government', 'federal'
+        }
+        
+        found_skills = []
+        description_lower = description.lower()
+        
+        for skill in skills_keywords:
+            if skill in description_lower:
+                found_skills.append(skill)
+        
+        return found_skills
+
+
+class CSVExporter:
+    def __init__(self):
+        pass
+    
+    def export(self, jobs: List[Dict], filename: str) -> str:
+        """Export jobs to CSV file"""
+        try:
+            if not jobs:
+                logger.warning("No jobs to export to CSV")
+                return filename
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(jobs)
+            
+            # Select columns to export (prioritize important ones)
+            all_columns = df.columns.tolist()
+            
+            # Common job columns to export
+            preferred_columns = [
+                'title', 'company_standardized', 'location_standardized',
+                'source', 'seniority_level', 'job_type', 'work_arrangement',
+                'salary_min_parsed', 'salary_max_parsed', 'salary_midpoint',
+                'salary_range', 'is_remote', 'has_salary', 'post_date_str',
+                'description_length', 'title_word_count', 'industry',
+                'required_skills', 'url', 'scraped_at_str'
+            ]
+            
+            # Use preferred columns that exist in the dataframe
+            export_columns = []
+            for col in preferred_columns:
+                if col in all_columns:
+                    export_columns.append(col)
+            
+            # Add any remaining columns
+            for col in all_columns:
+                if col not in export_columns:
+                    export_columns.append(col)
+            
+            # Limit to reasonable number of columns for Excel
+            if len(export_columns) > 50:
+                export_columns = export_columns[:50]
+                logger.info(f"Limited to 50 columns for Excel compatibility")
+            
+            # Create export dataframe
+            export_df = df[export_columns].copy()
+            
+            # Clean data for CSV (handle lists, NaN, etc.)
+            for col in export_df.columns:
+                # Convert lists to strings
+                if export_df[col].apply(lambda x: isinstance(x, list)).any():
+                    export_df[col] = export_df[col].apply(
+                        lambda x: ', '.join(map(str, x)) if isinstance(x, list) else x
+                    )
+                # Convert dicts to strings
+                if export_df[col].apply(lambda x: isinstance(x, dict)).any():
+                    export_df[col] = export_df[col].apply(
+                        lambda x: str(x) if isinstance(x, dict) else x
+                    )
+                # Convert None to empty string
+                export_df[col] = export_df[col].where(pd.notnull(export_df[col]), '')
+            
+            # Save to CSV
+            export_df.to_csv(filename, index=False, encoding='utf-8')
+            
+            logger.info(f"Exported {len(df)} jobs to CSV: {filename}")
+            logger.info(f"Columns exported: {len(export_columns)}")
+            
+            return filename
+            
+        except Exception as e:
+            logger.error(f"Error exporting to CSV: {str(e)}")
+            
+            # Fallback: simple CSV export
+            try:
+                with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+                    if jobs:
+                        fieldnames = jobs[0].keys()
+                        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                        writer.writeheader()
+                        for job in jobs:
+                            # Convert any non-string values
+                            cleaned_job = {}
+                            for key, value in job.items():
+                                if isinstance(value, list):
+                                    cleaned_job[key] = ', '.join(str(v) for v in value)
+                                elif isinstance(value, dict):
+                                    cleaned_job[key] = str(value)
+                                else:
+                                    cleaned_job[key] = value if value is not None else ''
+                            writer.writerow(cleaned_job)
+                
+                logger.info(f"Fallback export: {len(jobs)} jobs to {filename}")
+                return filename
+            except Exception as fallback_error:
+                logger.error(f"Fallback CSV export also failed: {str(fallback_error)}")
+                raise
+    
+    def export_for_excel(self, jobs: List[Dict], filename: str) -> str:
+        """Export specifically optimized for Excel"""
+        try:
+            if not jobs:
+                return filename
+            
+            df = pd.DataFrame(jobs)
+            
+            # Excel-friendly columns (shorter names, no special characters)
+            column_rename = {
+                'company_standardized': 'Company',
+                'location_standardized': 'Location',
+                'seniority_level': 'Seniority',
+                'job_type': 'Job_Type',
+                'work_arrangement': 'Work_Arrangement',
+                'salary_min_parsed': 'Salary_Min',
+                'salary_max_parsed': 'Salary_Max',
+                'salary_midpoint': 'Salary_Avg',
+                'salary_range': 'Salary_Range',
+                'is_remote': 'Is_Remote',
+                'post_date_str': 'Post_Date',
+                'scraped_at_str': 'Scraped_Date',
+                'description_length': 'Desc_Length',
+                'title_word_count': 'Title_Word_Count',
+                'required_skills': 'Skills'
+            }
+            
+            # Create Excel-friendly dataframe
+            excel_df = df.copy()
+            
+            # Rename columns
+            for old_name, new_name in column_rename.items():
+                if old_name in excel_df.columns:
+                    excel_df = excel_df.rename(columns={old_name: new_name})
+            
+            # Ensure date columns are strings for Excel
+            date_columns = ['Post_Date', 'Scraped_Date']
+            for col in date_columns:
+                if col in excel_df.columns:
+                    excel_df[col] = excel_df[col].astype(str)
+            
+            # Save to CSV (Excel can open CSV)
+            excel_df.to_csv(filename, index=False, encoding='utf-8')
+            
+            logger.info(f"Excel-optimized export: {filename}")
+            return filename
+            
+        except Exception as e:
+            logger.error(f"Excel export failed: {str(e)}")
+            return self.export(jobs, filename)
+
+
+class DatabaseManager:
+    def __init__(self, db_path='job_analytics.db'):
+        self.db_path = db_path
+        self._init_database()
+    
+    def _init_database(self):
+        """Initialize database with required tables"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        # Jobs table - FIXED TIMESTAMP
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                source_id TEXT,
+                title TEXT NOT NULL,
+                company_standardized TEXT,
+                location_standardized TEXT,
+                description TEXT,
+                url TEXT,
+                post_date TEXT,
+                scraped_at TEXT NOT NULL,
+                salary_min REAL,
+                salary_max REAL,
+                salary_midpoint REAL,
+                seniority_level TEXT,
+                is_remote BOOLEAN,
+                job_hash TEXT UNIQUE,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+        ''')
+        
+        # Skills table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS job_skills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                skill TEXT NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                UNIQUE(job_id, skill)
+            )
+        ''')
+        
+        # Create indexes for performance
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs(source)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company_standardized)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_jobs_location ON jobs(location_standardized)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_jobs_post_date ON jobs(post_date)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_skills_skill ON job_skills(skill)')
+        
+        # Metadata table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"Database initialized at {self.db_path}")
+    
+    def _get_connection(self):
+        """Get database connection"""
+        return sqlite3.connect(self.db_path)
+    
+    def insert_jobs(self, jobs: List[Dict]):
+        """Insert or update jobs in database"""
+        if not jobs:
+            logger.warning("No jobs to insert")
+            return 0
+        
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        inserted_count = 0
+        updated_count = 0
+        
+        for job in jobs:
+            try:
+                # Create job hash for deduplication
+                job_hash = self._create_job_hash(job)
+                job['job_hash'] = job_hash
+                
+                # Check if job already exists
+                cursor.execute('SELECT id FROM jobs WHERE job_hash = ?', (job_hash,))
+                existing = cursor.fetchone()
+                
+                if existing:
+                    # Update existing job
+                    job_id = existing[0]
+                    self._update_job(cursor, job_id, job)
+                    updated_count += 1
+                else:
+                    # Insert new job
+                    job_id = self._insert_new_job(cursor, job)
+                    
+                    # Insert skills
+                    if 'required_skills' in job and job['required_skills']:
+                        self._insert_skills(cursor, job_id, job['required_skills'])
+                    
+                    inserted_count += 1
+                
+            except Exception as e:
+                logger.error(f"Failed to insert job: {e}")
+                continue
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"Database insert complete: {inserted_count} new, {updated_count} updated")
+        return inserted_count
+    
+    def _create_job_hash(self, job: Dict) -> str:
+        """Create unique hash for a job"""
+        hash_string = f"{job.get('title', '')}|{job.get('company_standardized', job.get('company', ''))}|{job.get('location_standardized', job.get('location', ''))}"
+        return hashlib.md5(hash_string.encode()).hexdigest()
+    
+    def _insert_new_job(self, cursor, job: Dict) -> int:
+        """Insert a new job record"""
+        cursor.execute('''
+            INSERT INTO jobs (
+                source, source_id, title, company_standardized, location_standardized,
+                description, url, post_date, scraped_at, salary_min, salary_max,
+                salary_midpoint, seniority_level, is_remote, job_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            job.get('source'),
+            job.get('source_id'),
+            job.get('title'),
+            job.get('company_standardized'),
+            job.get('location_standardized'),
+            job.get('description'),
+            job.get('url'),
+            job.get('post_date'),
+            job.get('scraped_at'),
+            job.get('salary_min'),
+            job.get('salary_max'),
+            job.get('salary_midpoint'),
+            job.get('seniority_level'),
+            job.get('is_remote', False),
+            job.get('job_hash')
+        ))
+        
+        return cursor.lastrowid
+    
+    def _update_job(self, cursor, job_id: int, job: Dict):
+        """Update existing job record"""
+        cursor.execute('''
+            UPDATE jobs SET
+                title = ?,
+                description = ?,
+                url = ?,
+                salary_min = ?,
+                salary_max = ?,
+                salary_midpoint = ?,
+                seniority_level = ?,
+                is_remote = ?,
+                updated_at = datetime('now')
+            WHERE id = ?
+        ''', (
+            job.get('title'),
+            job.get('description'),
+            job.get('url'),
+            job.get('salary_min'),
+            job.get('salary_max'),
+            job.get('salary_midpoint'),
+            job.get('seniority_level'),
+            job.get('is_remote', False),
+            job_id
+        ))
+    
+    def _insert_skills(self, cursor, job_id: int, skills: List[str]):
+        """Insert skills for a job"""
+        for skill in skills:
+            if skill and len(skill) <= 100:  # Sanity check
+                try:
+                    cursor.execute(
+                        'INSERT OR IGNORE INTO job_skills (job_id, skill) VALUES (?, ?)',
+                        (job_id, skill.lower().strip())
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to insert skill {skill}: {e}")
+    
+    def get_job_count(self) -> int:
+        """Get total number of jobs in database"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM jobs')
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+    
+    def export_to_csv(self, output_path: str = 'job_data_export.csv'):
+        """Export all jobs to CSV for analysis"""
+        conn = self._get_connection()
+        
+        # Read into pandas
+        query = '''
+            SELECT 
+                j.*,
+                GROUP_CONCAT(js.skill, ', ') as skills_list
+            FROM jobs j
+            LEFT JOIN job_skills js ON j.id = js.job_id
+            GROUP BY j.id
+        '''
+        
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        
+        # Save to CSV
+        df.to_csv(output_path, index=False, encoding='utf-8')
+        logger.info(f"Exported {len(df)} jobs to {output_path}")
+        return output_path
+
+
+class JSONExporter:
+    def __init__(self):
+        pass
+    
+    def export(self, jobs: List[Dict], filename: str) -> str:
+        """Export jobs to JSON file"""
+        try:
+            if not jobs:
+                logger.warning("No jobs to export to JSON")
+                # Create empty JSON file
+                with open(filename, 'w') as f:
+                    json.dump({"jobs": [], "metadata": {}}, f, indent=2)
+                return filename
+            
+            # Prepare data for JSON serialization
+            serializable_jobs = []
+            
+            for job in jobs:
+                serializable_job = {}
+                for key, value in job.items():
+                    # Handle non-serializable types
+                    if isinstance(value, datetime):
+                        serializable_job[key] = value.isoformat()
+                    elif isinstance(value, (pd.Timestamp, pd.Series, pd.DataFrame)):
+                        # Skip pandas objects or convert to string
+                        if hasattr(value, 'dtype'):
+                            if pd.isna(value):
+                                serializable_job[key] = None
+                            else:
+                                serializable_job[key] = str(value)
+                        else:
+                            serializable_job[key] = str(value)
+                    elif isinstance(value, (list, tuple)):
+                        # Ensure list items are serializable
+                        serializable_job[key] = [
+                            str(item) if not isinstance(item, (str, int, float, bool, type(None))) 
+                            else item for item in value
+                        ]
+                    elif isinstance(value, dict):
+                        # Recursively handle dicts
+                        serializable_job[key] = {
+                            k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) 
+                            else v for k, v in value.items()
+                        }
+                    else:
+                        serializable_job[key] = value
+                
+                serializable_jobs.append(serializable_job)
+            
+            # Add metadata
+            export_data = {
+                "metadata": {
+                    "export_date": datetime.now().isoformat(),
+                    "total_jobs": len(jobs),
+                    "sources": list(set(job.get('source', 'unknown') for job in jobs)),
+                    "data_version": "1.0"
+                },
+                "jobs": serializable_jobs
+            }
+            
+            # Export to JSON
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(export_data, f, indent=2, ensure_ascii=False, default=str)
+            
+            logger.info(f"Exported {len(jobs)} jobs to JSON: {filename}")
+            return filename
+            
+        except Exception as e:
+            logger.error(f"Error exporting to JSON: {str(e)}")
+            
+            # Fallback: simple JSON export
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    # Convert everything to string as last resort
+                    simple_jobs = []
+                    for job in jobs:
+                        simple_job = {}
+                        for key, value in job.items():
+                            if value is None:
+                                simple_job[key] = None
+                            elif isinstance(value, (str, int, float, bool)):
+                                simple_job[key] = value
+                            else:
+                                simple_job[key] = str(value)
+                        simple_jobs.append(simple_job)
+                    
+                    json.dump({"jobs": simple_jobs}, f, indent=2)
+                
+                logger.info(f"Fallback JSON export: {filename}")
+                return filename
+            except Exception as fallback_error:
+                logger.error(f"Fallback JSON export also failed: {str(fallback_error)}")
+                raise
+    
+    def export_minimal(self, jobs: List[Dict], filename: str) -> str:
+        """Export minimal job data for quick loading"""
+        try:
+            if not jobs:
+                return filename
+            
+            # Extract only essential fields
+            minimal_jobs = []
+            essential_fields = [
+                'title', 'company_standardized', 'location_standardized',
+                'salary_min_parsed', 'salary_max_parsed', 'salary_midpoint',
+                'seniority_level', 'job_type', 'is_remote', 'source',
+                'post_date_str', 'url'
+            ]
+            
+            for job in jobs:
+                minimal_job = {}
+                for field in essential_fields:
+                    if field in job:
+                        value = job[field]
+                        if isinstance(value, datetime):
+                            minimal_job[field] = value.isoformat()
+                        else:
+                            minimal_job[field] = value
+                minimal_jobs.append(minimal_job)
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(minimal_jobs, f, indent=2, default=str)
+            
+            logger.info(f"Minimal JSON export: {len(minimal_jobs)} jobs to {filename}")
+            return filename
+            
+        except Exception as e:
+            logger.error(f"Minimal JSON export failed: {str(e)}")
+            return self.export(jobs, filename)
+
+
+class OpenDatasetLoader:
+    """
+    Loads job-related datasets from public URLs (NO API, NO AUTH)
+    """
+    
+    def __init__(self):
+        self.datasets = {
+            "salary_prediction": {
+                "url": "https://raw.githubusercontent.com/tylerjrichards/Salary-Prediction/main/data_cleaned.csv",
+                "description": "Open salary prediction dataset with job data"
+            }
+        }
+    
+    def load_public_dataset(self, dataset_name: str = "salary_prediction", 
+                           limit: int = 50000) -> List[Dict]:
+        """
+        Load dataset from public URL
+        """
+        try:
+            if dataset_name not in self.datasets:
+                logger.error(f"Dataset {dataset_name} not found")
+                return []
+            
+            url = self.datasets[dataset_name]["url"]
+            logger.info(f"Loading public dataset from {url}")
+            
+            # Download and load the dataset
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            
+            # Save to temporary file or process in memory
+            df = pd.read_csv(pd.io.common.StringIO(response.text))
+            logger.info(f"Loaded {len(df)} rows from public dataset")
+            
+            # Clean and standardize
+            df = df.drop_duplicates().fillna("Unknown")
+            
+            jobs = []
+            
+            for _, row in df.iterrows():
+                try:
+                    # Map columns from the public dataset to our standard format
+                    job = {
+                        "source": "public_dataset",
+                        "source_id": f"pub_{hash(str(row))}",
+                        "title": str(row.get("Job Title", row.get("job_title", "Unknown"))),
+                        "company": str(row.get("Company", row.get("company_name", "Unknown"))),
+                        "company_standardized": str(row.get("Company", row.get("company_name", "Unknown"))),
+                        "location": str(row.get("Location", row.get("location", "Unknown"))),
+                        "location_standardized": str(row.get("Location", row.get("location", "Unknown"))),
+                        "description": str(row.get("Job Description", row.get("job_description", ""))),
+                        "salary": str(row.get("Salary", row.get("salary_estimate", ""))),
+                        "post_date": datetime.now().strftime('%Y-%m-%d'),
+                        "post_date_str": datetime.now().strftime('%Y-%m-%d'),
+                        "scraped_at": datetime.now().isoformat(),
+                        "scraped_at_str": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        "required_skills": self._extract_skills_from_description(str(row.get("Job Description", row.get("job_description", "")))),
+                        "job_type": "Full-time",  # Default assumption
+                        "work_arrangement": "On-site",  # Default assumption
+                        "is_remote": False
+                    }
+                    
+                    # Try to parse salary if available
+                    salary_str = str(row.get("Salary", "")).lower()
+                    if 'k' in salary_str or '$' in salary_str:
+                        job.update(self._parse_salary(salary_str))
+                    
+                    jobs.append(job)
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to process row: {e}")
+                    continue
+            
+            # Apply limit
+            jobs = jobs[:limit]
+            logger.info(f"Processed {len(jobs)} jobs from public dataset")
+            
+            return jobs
+            
+        except Exception as e:
+            logger.error(f"Error loading public dataset: {e}")
+            return []
+    
+    def _extract_skills_from_description(self, description: str) -> List[str]:
+        """Extract skills from job description"""
+        if not isinstance(description, str):
+            return []
+        
+        skill_patterns = [
+            r'\b(python|java|sql|r|scala|c\+\+|c#|go|ruby|javascript)\b',
+            r'\b(aws|azure|gcp|docker|kubernetes|terraform)\b',
+            r'\b(spark|hadoop|kafka|airflow)\b',
+            r'\b(pandas|numpy|tableau|power\s*bi|excel)\b',
+            r'\b(machine\s*learning|deep\s*learning|ai|artificial\s*intelligence)\b'
+        ]
+        
+        skills = set()
+        description_lower = description.lower()
+        
+        for pattern in skill_patterns:
+            matches = re.findall(pattern, description_lower)
+            for match in matches:
+                if isinstance(match, tuple):
+                    skills.update([m for m in match if m])
+                else:
+                    skills.add(match)
+        
+        return list(skills)
+    
+    def _parse_salary(self, salary_str: str) -> Dict:
+        """Parse salary string to numeric values"""
+        try:
+            # Remove non-numeric characters except dots and dashes
+            cleaned = re.sub(r'[^\d\.\-kK]', '', salary_str.lower())
+            
+            # Handle "k" notation (thousands)
+            if 'k' in cleaned:
+                cleaned = cleaned.replace('k', '000')
+            
+            # Extract numbers
+            numbers = re.findall(r'\d+', cleaned)
+            
+            if len(numbers) >= 2:
+                salary_min = float(numbers[0])
+                salary_max = float(numbers[1])
+                return {
+                    'salary_min': salary_min,
+                    'salary_max': salary_max,
+                    'salary_min_parsed': salary_min,
+                    'salary_max_parsed': salary_max,
+                    'salary_midpoint': (salary_min + salary_max) / 2,
+                    'salary_range': f"${salary_min:,.0f}-${salary_max:,.0f}"
+                }
+            elif len(numbers) == 1:
+                salary = float(numbers[0])
+                return {
+                    'salary_min': salary,
+                    'salary_max': salary,
+                    'salary_min_parsed': salary,
+                    'salary_max_parsed': salary,
+                    'salary_midpoint': salary,
+                    'salary_range': f"${salary:,.0f}"
+                }
+        except:
+            pass
+        
+        return {}
+
+
+class DataCleaner:
+    """Clean and standardize job data"""
+    
+    def __init__(self):
+        pass
+    
+    def clean_and_standardize(self, jobs: List[Dict]) -> List[Dict]:
+        """Clean and standardize job data"""
+        cleaned_jobs = []
+        
+        for job in jobs:
+            try:
+                cleaned_job = job.copy()
+                
+                # Standardize company names
+                if 'company' in cleaned_job:
+                    cleaned_job['company_standardized'] = self._standardize_company(cleaned_job['company'])
+                
+                # Standardize locations
+                if 'location' in cleaned_job:
+                    cleaned_job['location_standardized'] = self._standardize_location(cleaned_job['location'])
+                
+                # Calculate derived fields
+                cleaned_job['description_length'] = len(str(cleaned_job.get('description', '')))
+                cleaned_job['title_word_count'] = len(str(cleaned_job.get('title', '')).split())
+                cleaned_job['has_salary'] = bool(cleaned_job.get('salary_min') or cleaned_job.get('salary_max'))
+                
+                # Infer seniority level from title
+                cleaned_job['seniority_level'] = self._infer_seniority(cleaned_job.get('title', ''))
+                
+                # Government job specific standardization
+                if cleaned_job.get('source') == 'usajobs':
+                    cleaned_job['industry'] = 'Government'
+                    # Government jobs often have different salary structures
+                    if 'job_grade' in cleaned_job and cleaned_job['job_grade']:
+                        cleaned_job['government_grade'] = cleaned_job['job_grade']
+                
+                # Adzuna specific fields
+                if cleaned_job.get('source') == 'adzuna':
+                    if 'category' in cleaned_job:
+                        cleaned_job['industry'] = cleaned_job['category']
+                
+                # Public dataset specific
+                if cleaned_job.get('source') == 'public_dataset':
+                    cleaned_job['industry'] = 'Technology'  # Default assumption
+                
+                cleaned_jobs.append(cleaned_job)
+                
+            except Exception as e:
+                logger.warning(f"Failed to clean job: {e}")
+                continue
+        
+        return cleaned_jobs
+    
+    def _standardize_company(self, company: str) -> str:
+        """Standardize company name"""
+        if not company:
+            return "Unknown"
+        
+        # Remove common suffixes and standardize
+        company_lower = company.lower()
+        company_lower = re.sub(r'\.com$|\.org$|\.io$|inc\.?$|llc$|corp\.?$|corporation$', '', company_lower)
+        company_lower = company_lower.strip()
+        
+        # Capitalize first letter of each word
+        return ' '.join(word.capitalize() for word in company_lower.split())
+    
+    def _standardize_location(self, location: str) -> str:
+        """Standardize location"""
+        if not location:
+            return "Remote"
+        
+        # Common location standardization
+        location_lower = location.lower()
+        
+        if 'remote' in location_lower or 'anywhere' in location_lower:
+            return "Remote"
+        
+        # Extract just the city/state for US locations
+        if 'united states' in location_lower:
+            parts = location_lower.split(',')
+            if len(parts) > 1:
+                return parts[0].strip().title() + ', ' + parts[1].strip().upper()[:2]
+        
+        # Government job specific location handling
+        if 'multiple locations' in location_lower:
+            return "Multiple Locations"
+        
+        return location.strip().title()
+    
+    def _infer_seniority(self, title: str) -> str:
+        """Infer seniority level from job title"""
+        if not title:
+            return "Unknown"
+        
+        title_lower = title.lower()
+        
+        # Government job grade detection
+        if any(word in title_lower for word in ['gs-', 'gs ', 'general schedule']):
+            return "Government"
+        elif any(word in title_lower for word in ['senior', 'sr.', 'lead', 'principal', 'staff', 'iii', 'iv', 'v']):
+            return "Senior"
+        elif any(word in title_lower for word in ['junior', 'jr.', 'entry', 'associate', 'graduate', 'i', 'ii']):
+            return "Junior"
+        elif any(word in title_lower for word in ['intern', 'internship']):
+            return "Intern"
+        elif any(word in title_lower for word in ['director', 'vp', 'vice president', 'head of', 'chief']):
+            return "Director"
+        elif any(word in title_lower for word in ['manager', 'mgr', 'supervisor']):
+            return "Manager"
+        
+        return "Mid-level"
+
+
+def deduplicate_jobs(jobs: List[Dict]) -> List[Dict]:
+    """Remove duplicate jobs based on title, company, and location"""
+    seen = set()
+    unique_jobs = []
+    
+    for job in jobs:
+        # Create a unique key
+        key = (job.get('title', '').lower().strip(),
+               job.get('company_standardized', job.get('company', '')).lower().strip(),
+               job.get('location_standardized', job.get('location', '')).lower().strip())
+        
+        if key not in seen:
+            seen.add(key)
+            unique_jobs.append(job)
+    
+    # FIXED: Use ASCII arrow to avoid Unicode issues
+    logger.info(f"Deduplication: {len(jobs)} -> {len(unique_jobs)} jobs")
+    return unique_jobs
+
+
+class JobDataPipeline:
+    def __init__(self, keywords, location=None):
+        self.keywords = keywords
+        self.location = location
+        self.db = DatabaseManager()
+
+        self.collectors = {
+            "adzuna": AdzunaCollector(),
+            "usajobs": USAJobsCollector(),
+            "open_dataset": OpenDatasetLoader()
+        }
+
+    def run_collection(self, max_results_per_source=1000):
+        """Collect raw jobs from all sources"""
+        all_jobs = []
+
+        logger.info(f"Starting data collection for keyword: {self.keywords}")
+
+        # 1. Open Dataset (public bulk data - NO API, NO AUTH)
+        try:
+            logger.info("Loading public dataset...")
+            public_jobs = self.collectors["open_dataset"].load_public_dataset(
+                limit=50000
+            )
+            all_jobs.extend(public_jobs)
+            logger.info(f"Public dataset jobs collected: {len(public_jobs)}")
+        except Exception as e:
+            logger.warning(f"Public dataset collection failed: {e}")
+
+        # 2. Adzuna API (Private sector jobs)
+        try:
+            logger.info("Collecting from Adzuna API...")
+            adzuna_jobs = self.collectors["adzuna"].fetch_jobs(
+                keywords=self.keywords,
+                max_results=max_results_per_source,
+                country="us"
+            )
+            all_jobs.extend(adzuna_jobs)
+            logger.info(f"Adzuna jobs collected: {len(adzuna_jobs)}")
+        except Exception as e:
+            logger.warning(f"Adzuna API failed: {e}")
+
+        # 3. USAJOBS API (Government jobs)
+        try:
+            logger.info("Collecting from USAJOBS API...")
+            usajobs_jobs = self.collectors["usajobs"].fetch_jobs(
+                keywords=self.keywords,
+                max_results=min(max_results_per_source, 500)  # USAJOBS has limits
+            )
+            all_jobs.extend(usajobs_jobs)
+            logger.info(f"USAJOBS jobs collected: {len(usajobs_jobs)}")
+        except Exception as e:
+            logger.warning(f"USAJOBS API failed: {e}")
+
+        logger.info(f"Total raw jobs collected: {len(all_jobs)}")
+        return all_jobs
+
+    def run_pipeline(self):
+        """Complete ETL pipeline execution"""
+        try:
+            # =====================
+            # EXTRACT
+            # =====================
+            raw_jobs = self.run_collection()
+            if not raw_jobs:
+                logger.warning("No jobs collected. Exiting pipeline.")
+                return 0
+
+            # =====================
+            # TRANSFORM
+            # =====================
+            cleaner = DataCleaner()
+            cleaned_jobs = cleaner.clean_and_standardize(raw_jobs)
+
+            unique_jobs = deduplicate_jobs(cleaned_jobs)
+            logger.info(f"Jobs after deduplication: {len(unique_jobs)}")
+
+            if not unique_jobs:
+                logger.warning("No jobs after cleaning & deduplication.")
+                return 0
+
+            # =====================
+            # LOAD
+            # =====================
+            inserted_count = self.db.insert_jobs(unique_jobs)
+
+            # =====================
+            # EXPORT
+            # =====================
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            csv_file = f"job_data_{timestamp}.csv"
+            json_file = f"job_data_{timestamp}.json"
+            excel_file = f"job_data_excel_{timestamp}.csv"
+            
+            CSVExporter().export(unique_jobs, csv_file)
+            JSONExporter().export(unique_jobs, json_file)
+            CSVExporter().export_for_excel(unique_jobs, excel_file)
+
+            # FIXED: Use ASCII arrow to avoid Unicode issues
+            logger.info(f"Exported data -> {csv_file}, {json_file}, {excel_file}")
+            
+            # Print summary statistics
+            self._print_summary(unique_jobs)
+
+            logger.info("Pipeline completed successfully!")
+            return inserted_count
+
+        except Exception as e:
+            logger.exception("Pipeline failed")
+            raise e
+    
+    def _print_summary(self, jobs: List[Dict]):
+        """Print summary statistics of collected jobs"""
+        if not jobs:
+            return
+        
+        df = pd.DataFrame(jobs)
+        
+        print("\n" + "="*60)
+        print("JOB DATA PIPELINE - SUMMARY REPORT")
+        print("="*60)
+        
+        # Source distribution
+        source_counts = df['source'].value_counts()
+        print("\n1. DATA SOURCES:")
+        for source, count in source_counts.items():
+            percentage = (count / len(df)) * 100
+            print(f"   {source}: {count} jobs ({percentage:.1f}%)")
+        
+        # Remote work statistics
+        remote_count = df['is_remote'].sum() if 'is_remote' in df.columns else 0
+        remote_percentage = (remote_count / len(df)) * 100
+        print(f"\n2. REMOTE WORK: {remote_count} jobs ({remote_percentage:.1f}%)")
+        
+        # Salary statistics
+        if 'salary_midpoint' in df.columns:
+            avg_salary = df['salary_midpoint'].mean()
+            median_salary = df['salary_midpoint'].median()
+            print(f"\n3. SALARY ANALYSIS:")
+            print(f"   Average salary: ${avg_salary:,.0f}")
+            print(f"   Median salary: ${median_salary:,.0f}")
+            
+            # Salary by source
+            print(f"   Average salary by source:")
+            for source in df['source'].unique():
+                source_salaries = df[df['source'] == source]['salary_midpoint']
+                if not source_salaries.empty:
+                    avg = source_salaries.mean()
+                    print(f"     {source}: ${avg:,.0f}")
+        
+        # Top companies
+        if 'company_standardized' in df.columns:
+            top_companies = df['company_standardized'].value_counts().head(5)
+            print(f"\n4. TOP 5 COMPANIES:")
+            for company, count in top_companies.items():
+                print(f"   {company}: {count} jobs")
+        
+        # Top skills
+        all_skills = []
+        for skills in df['required_skills'].dropna():
+            if isinstance(skills, list):
+                all_skills.extend(skills)
+        
+        from collections import Counter
+        skill_counts = Counter(all_skills)
+        top_skills = skill_counts.most_common(10)
+        
+        print(f"\n5. TOP 10 IN-DEMAND SKILLS:")
+        for skill, count in top_skills:
+            percentage = (count / len(df)) * 100
+            print(f"   {skill}: {count} jobs ({percentage:.1f}%)")
+        
+        print("\n" + "="*60)
+        print(f"TOTAL JOBS PROCESSED: {len(df)}")
+        print("="*60 + "\n")
+
+
+if __name__ == "__main__":
+    # Setup logging already configured at the top
+    
+    print("="*60)
+    print("JOB DATA COLLECTION PIPELINE")
+    print("="*60)
+    print("This pipeline collects job data from multiple sources:")
+    print("1. Public Dataset: Historical job data (NO API, NO AUTH)")
+    print("2. Adzuna API: Private sector job listings")
+    print("3. USAJOBS API: U.S. government job listings")
+    print("="*60)
+    
+    # Get user input for search
+    keyword = input("Enter job search keyword (default: 'data scientist'): ").strip()
+    if not keyword:
+        keyword = "data scientist"
+    
+    location = input("Enter location (default: 'United States'): ").strip()
+    if not location:
+        location = "United States"
+    
+    # Run the pipeline
+    pipeline = JobDataPipeline(
+        keywords=keyword,
+        location=location
+    )
+    
+    print(f"\nStarting pipeline for: '{keyword}' in '{location}'...")
+    print("This may take a few minutes depending on API rates...\n")
+    
+    try:
+        job_count = pipeline.run_pipeline()
+        print(f" Pipeline complete! Processed {job_count} jobs.")
+        print(f" Check 'job_pipeline.log' for detailed logs.")
+        print(f" Data exported to CSV, JSON, and Excel formats.")
+    except Exception as e:
+        print(f" Pipeline failed with error: {e}")
+        print("Check the log file for more details.")
