@@ -93,6 +93,14 @@ ORDER BY job_count DESC;
 
 - Data visualization best practices for executive and analytical reporting
 
+## Project Status & Notes
+
+This project represents the first iteration of an end-to-end job market analytics pipeline.
+
+Some dashboard visuals (location, company, and skills analysis) are part of an early BI iteration and will be refined to correct aggregation grain (e.g., replacing summed averages with median/mean salary at the posting level).
+
+This repository will be updated with a refactored data model and improved visualizations in a future iteration.
+
 ## Important Usage Notice
 
 This project is a portfolio and demonstration project created to showcase data analytics and business intelligence skills.
