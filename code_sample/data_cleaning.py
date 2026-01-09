@@ -1,7 +1,6 @@
 """
 Job Market Data Cleaning Pipeline
-Cleans and standardizes raw job market data for analysis.
-Transforms inconsistent data into a clean, structured format.
+
 """
 
 import pandas as pd

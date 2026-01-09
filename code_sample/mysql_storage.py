@@ -1,6 +1,6 @@
 """
 Database setup and view creation for job market analysis.
-Deployment-ready version with logging, error handling, and configuration management.
+
 """
 
 import pandas as pd
