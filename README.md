@@ -1,5 +1,5 @@
 # Job Market Analytics Dashboard
-*A comprehensive Power BI dashboard for real-time job market analysis with real time data pipelines.*
+*A comprehensive Power BI dashboard for real-time job market analysis with automated data pipelines.*
  
  ## Project Overview
 This end-to-end data analytics project transforms raw job market data into actionable business intelligence through a 4-page interactive Power BI dashboard. The system includes automated data collection, structured data cleaning, and a MySQL-based data warehouse, enabling continuous analysis of hiring trends, skills demand, salaries, and locations.
