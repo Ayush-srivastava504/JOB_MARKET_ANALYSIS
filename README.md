@@ -56,7 +56,7 @@ Outcome:
 ### Technology Stack:
 | Layer | Technology | Purpose |
 |-------|------------|---------|
-| **Data Collection** | Python (BeautifulSoup/Requests) | Scrape job postings from various sources |
+| **Data Collection** | Python (API) | Get job postings from various sources |
 | **Data Processing** | Pandas, NumPy | Clean, transform, and structure data |
 | **Data Storage** | MySQL 8.0 | Centralized data warehouse with optimized views |
 | **Visualization** | Power BI Desktop | Interactive dashboards with DAX calculations |
