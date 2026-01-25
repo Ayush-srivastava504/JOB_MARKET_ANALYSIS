@@ -2,7 +2,7 @@
 *A comprehensive Power BI dashboard for real-time job market analysis with automated data pipelines.*
  
  ## Project Overview
-This end-to-end data analytics project transforms raw job market data into actionable business intelligence through a 4-page interactive Power BI dashboard. The system features automated data collection, MySQL data warehousing, and cloud deployment with scheduled refresh.
+This end-to-end data analytics project transforms raw job market data into actionable business intelligence through a 4-page interactive Power BI dashboard. The system includes automated data collection, structured data cleaning, and a MySQL-based data warehouse, enabling continuous analysis of hiring trends, skills demand, salaries, and locations.
 ### Page 1: Executive Dashboard – Job Market Overview
 ![Executive Dashboard](images/page1_executive_dashboard.png)
  Outcome:
@@ -56,7 +56,7 @@ Outcome:
 ### Technology Stack:
 | Layer | Technology | Purpose |
 |-------|------------|---------|
-| **Data Collection** | Python (BeautifulSoup/Requests) | Scrape job postings from various sources |
+| **Data Collection** | Python (API) | Get job postings from various sources |
 | **Data Processing** | Pandas, NumPy | Clean, transform, and structure data |
 | **Data Storage** | MySQL 8.0 | Centralized data warehouse with optimized views |
 | **Visualization** | Power BI Desktop | Interactive dashboards with DAX calculations |
