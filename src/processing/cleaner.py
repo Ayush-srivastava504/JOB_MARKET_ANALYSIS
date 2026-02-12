@@ -4,7 +4,6 @@ from pathlib import Path
 from .salary import parse_salary_string
 
 def clean_jobs(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize column names, parse salaries, dates, remote flag."""
     df = df.copy()
 
     # snake_case columns
