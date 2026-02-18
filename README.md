@@ -1,4 +1,12 @@
 # Job Market Analytics Dashboard
+
+[![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)
+[![Data Pipeline](https://img.shields.io/badge/Pipeline-Staging%20%E2%86%92%20Intermediate%20%E2%86%92%20Marts-brightgreen)](#data-architecture)
+[![Status](https://img.shields.io/badge/Project-Production%20Ready-success)]()
+[![SQL](https://img.shields.io/badge/SQL-PostgreSQL-blue)]()
+[![Dashboard](https://img.shields.io/badge/Dashboard-Power%20BI-yellow)]()
+
 *A comprehensive Power BI dashboard for real-time job market analysis with automated data pipelines.*
  
  ## Project Overview
